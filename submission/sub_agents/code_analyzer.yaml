@@ -1,20 +1,22 @@
-# Read-only localisation helper, exposed to the root agent via AgentTool.
+# Read-only localisation helper. Attach from agent.yaml with:
+#   tools: [..., {agent_tool: {config_path: sub_agents/code_analyzer.yaml, skip_summarization: false}}]
+# skip_summarization: true ends the coder's turn after each call and triggers harness nudges.
 name: code_analyzer
-agent_class: LlmAgent
 model: gemma-4-31b-it-qat-w4a16-ct
-# adapter: tool_lora          # optional separate adapter for the analyzer
 description: >-
-  Read-only analyst. Given a precise question about the repository in
+  Read-only analyst. Given one precise question about the repository in
   /workspace, returns the files, line numbers and symbols that matter plus the
   likely minimal fix. Never edits files.
 instruction: !include ../prompts/analyzer.md
 generate_content_config:
   temperature: 0.2
   top_p: 0.95
-  max_output_tokens: 2048
+  top_k: 40
+  max_output_tokens: 1536
+  thinking_config:
+    include_thoughts: false
 tools:
-  - name: run_command
-  - name: read_file
-  - name: search_similar_code
-  - name: get_code_neighbors
-  - name: get_code_subgraph
+  - run_command
+  - read_file
+  - search_similar_code
+  - get_code_neighbors

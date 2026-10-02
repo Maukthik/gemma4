@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Score predicted patches locally, mimicking the competition's Phase-2 grading.
 
+Prefer the official `swegemma eval` (Kaggle dataset
+metric/gemma-4-developer-agent-wheelhouse) for agent runs; this script is a
+lightweight re-scorer for patches you already have (e.g. submission.parquet,
+or `--gold` to sanity-check snapshots, wheels and test patches).
+
 For each task: unpack the snapshot, run the dataset's sandbox/setup.py
 (editable install from /wheels), apply the predicted patch, apply the task's
 test_patch, then run pytest on the test files that test_patch touches.
@@ -43,8 +48,9 @@ tar xzf /snap.tgz -C /workspace
 top=$(ls -A /workspace); if [ $(echo "$top" | wc -l) = 1 ] && [ ! -d .git ]; then shopt -s dotglob; mv "$top"/* . ; rmdir "$top"; fi
 python /setup.py >/tmp/setup.log 2>&1 || { echo SETUP_FAILED; tail -20 /tmp/setup.log; exit 3; }
 if [ -s /pred.patch ]; then git apply --whitespace=nowarn /pred.patch || { echo PRED_APPLY_FAILED; exit 4; }; fi
+for f in {tests}; do git checkout -q HEAD -- "$f" 2>/dev/null || rm -f "$f"; done  # grader resets test files
 git apply --whitespace=nowarn /test.patch || { echo TEST_APPLY_FAILED; exit 5; }
-timeout {timeout} python -m pytest -q -p no:cacheprovider {tests} 2>&1 | tail -15
+PYTHONSAFEPATH=1 timeout {timeout} python3 -m pytest {tests} -p no:anyio -o timeout=0 -q 2>&1 | tail -15
 exit ${PIPESTATUS[0]}
 """
 

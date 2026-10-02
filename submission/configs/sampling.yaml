@@ -1,7 +1,10 @@
-# Generation parameters (google.genai GenerateContentConfig fields).
-# Low temperature: tool calls need exact strings (edit_file old_string), so
-# we want near-greedy decoding. A little temperature avoids repetition loops.
+# Thinking OFF (include_thoughts: false -> chat_template_kwargs.enable_thinking=false).
+# With 32k context and ~4.5 min per task, thinking tokens cost turns we don't have.
+# Low temperature + top_k 40 is what every public 0.10-0.12 submission uses.
+# 4096 output tokens leaves room for prompts up to ~28k in the 32k window.
 temperature: 0.2
 top_p: 0.95
 top_k: 40
 max_output_tokens: 4096
+thinking_config:
+  include_thoughts: false

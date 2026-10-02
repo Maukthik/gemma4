@@ -37,20 +37,20 @@ def summarize(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=".")
-    ap.add_argument("--max-lines", type=int, default=120)
+    ap.add_argument("--root", default="/workspace" if os.path.isdir("/workspace") else ".")
+    ap.add_argument("--max-lines", type=int, default=60)
     ap.add_argument("--include-tests", action="store_true")
     a = ap.parse_args()
-    root = a.root if os.path.isabs(a.root) else os.path.join(os.getcwd(), a.root)
-    if not os.path.exists(root) and os.path.isdir("/workspace"):
-        root = os.path.join("/workspace", a.root)
+    root = a.root
+    if not os.path.isabs(root) and os.path.isdir("/workspace"):
+        root = os.path.join("/workspace", root)  # skill scripts may not run with cwd=/workspace
     lines = []
     for p in iter_py(root, a.include_tests):
         rel = os.path.relpath(p, root)
         s = summarize(p)
         lines.append(f"{rel}: {s}" if s else rel)
     for line in lines[: a.max_lines]:
-        print(line[:300])
+        print(line[:200])
     if len(lines) > a.max_lines:
         print(f"... {len(lines) - a.max_lines} more modules (narrow with --root)")
 

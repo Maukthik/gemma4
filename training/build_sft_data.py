@@ -24,6 +24,7 @@ Usage:
       --out training/data/sft.jsonl [--holdout 20]
 """
 import argparse
+import difflib
 import json
 import os
 import pathlib
@@ -36,7 +37,8 @@ import tarfile
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-SYSTEM_PROMPT = (HERE.parent / "submission" / "prompts" / "system.md").read_text(encoding="utf-8")
+SYSTEM_TEMPLATE = (HERE.parent / "submission" / "prompts" / "system.md").read_text(encoding="utf-8")
+BUDGET = {"minutes": 4.5, "calls": 40, "turns": 80, "timeout": 180}  # keep in sync with eval_config.yaml
 
 # Tool schemas mirroring the competition harness signatures.
 TOOLS = [
@@ -58,9 +60,18 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "submit_patch", "description": "Stages untracked files and captures git diff HEAD from /workspace.",
      "parameters": {"type": "object", "properties": {}}}},
+    # SkillToolset tools (ADK) added because agent.yaml declares skills
+    {"type": "function", "function": {"name": "list_skills", "description": "Lists all available skills with their names and descriptions.",
+     "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "load_skill", "description": "Loads the SKILL.md instructions for a given skill.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {"name": "load_skill_resource", "description": "Loads a resource file (from references/, assets/, or scripts/) from within a skill.",
+     "parameters": {"type": "object", "properties": {"skill_name": {"type": "string"}, "file_path": {"type": "string"}}, "required": ["skill_name", "file_path"]}}},
+    {"type": "function", "function": {"name": "run_skill_script", "description": "Executes a script from a skill's scripts/ directory.",
+     "parameters": {"type": "object", "properties": {"skill_name": {"type": "string"}, "file_path": {"type": "string"},
+                    "args": {"anyOf": [{"type": "object"}, {"type": "array", "items": {"type": "string"}}]}}, "required": ["skill_name", "file_path"]}}},
 ]
 
-MAX_OBS_CHARS = 6000
 
 
 # --------------------------------------------------------------------------- patch parsing
@@ -137,24 +148,97 @@ def make_edits(path_text: str, hunks):
     return edits, text
 
 
-# --------------------------------------------------------------------------- repo helpers
+# --------------------------------------------------------------------------- harness emulation
+# Observations mirror swegemma's JSON tool responses (ok_response / error_response)
+# and its limits: 5000-char command output, 150-line / 10k-char read_file.
+MAX_STDOUT = 5000
+
+
+def ok(**kw):
+    return json.dumps({"status": "ok", **kw})
+
+
+def err(error_type, message, details=None):
+    d = {"status": "error", "error_type": error_type, "error_message": message}
+    if details is not None:
+        d["details"] = details
+    return json.dumps(d)
+
+
 def sh(cmd, cwd, timeout=60):
+    """run_command semantics: non-zero exit -> CommandError with stdout/stderr details."""
     try:
-        r = subprocess.run(["bash", "-c", cmd], cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        out = r.stdout + r.stderr
+        r = subprocess.run(["bash", "-c", cmd], cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     except subprocess.TimeoutExpired:
-        out = f"Command timed out after {timeout}s"
-    return clip(out if out.strip() else "(no output)")
+        return err("TimeoutExceeded", f"Command timed out after {timeout} seconds")
+    out, errs = r.stdout[:MAX_STDOUT], r.stderr[:MAX_STDOUT]
+    if r.returncode != 0:
+        return err("CommandError", errs or out, {"stdout": out, "stderr": errs, "exit_code": r.returncode})
+    return ok(stdout=out, stderr=errs, exit_code=0)
 
 
-def clip(s):
-    return s if len(s) <= MAX_OBS_CHARS else s[:MAX_OBS_CHARS] + f"\n... [truncated {len(s) - MAX_OBS_CHARS} chars]"
+def raw(cmd, cwd):
+    return subprocess.run(["bash", "-c", cmd], cwd=cwd, capture_output=True, text=True).stdout
 
 
-def read_slice(root, path, start, end):
+def read_obs(root, path, start, end):
     lines = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
-    start, end = max(1, start), min(len(lines), end)
-    return "\n".join(f"{i}\t{lines[i - 1]}" for i in range(start, end + 1))
+    total = len(lines)
+    start, end = max(1, start), min(total, end)
+    trunc = False
+    if end - start + 1 > 150:
+        end, trunc = start + 149, True
+    snippet = "\n".join(lines[start - 1:end])
+    if len(snippet) > 10000:
+        snippet, trunc = snippet[:10000], True
+    return ok(filepath=path, content=snippet, start_line=start, end_line=end, total_lines=total, is_truncated=trunc)
+
+
+def edit_obs(path, before, after):
+    diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        fromfile=f"a/{path}", tofile=f"b/{path}", n=2))
+    return ok(filepath=path, occurrences=1, strategy="exact", diff=diff[:MAX_STDOUT],
+              is_truncated=len(diff) > MAX_STDOUT)
+
+
+def workspace_tree(root):
+    out = raw("find . -maxdepth 3 -not -path './.git*' -not -name '__pycache__' | sort | head -150", root)
+    return out.strip()
+
+
+def format_task(task, tree, budget):
+    """Same layout as swegemma.harness.agent_runner.build_agent_prompt."""
+    parts = [f"You are evaluating a software engineering task for repository {task['repo']}.\n\n"
+             f"Problem Statement:\n{task['problem_statement']}\n"]
+    if (task.get("hints_text") or "").strip():
+        parts.append(f"## Hints:\n{task['hints_text'].strip()}\n")
+    parts.append("## Task Budget (Session terminates when any budget is exhausted)\n"
+                 f"- Time allowance: {budget['minutes']} minutes\n- Tool calls allowance: {budget['calls']} calls\n"
+                 f"- Max loop iterations: {budget['turns']} turns\n")
+    parts.append("## Execution Environment Rules\n"
+                 f"- Single command timeout: {budget['timeout']} seconds (commands exceeding this fail without ending the session)\n"
+                 "- Command output limit: 5000 characters\n- File view limit: 150 lines per read_file call\n"
+                 "- File character limit: 10000 characters per read_file call\n"
+                 "- Environment is offline (no network/PyPI access). All repository and test dependencies are ALREADY "
+                 "pre-installed. Do NOT attempt to run pip install or download packages.\n")
+    parts.append("\n".join([
+        "## Instructions:",
+        "0. All source code is under `/workspace`. Do NOT search outside `/workspace` (e.g. `/usr/`, `/wheels/`, system "
+        "site-packages). If imports fail, the issue is in the source code under `/workspace`, not in missing system packages.",
+        "1. Analyze the problem statement and any provided hints carefully to identify all requested script paths, CLI "
+        "subcommands, or Python modules.",
+        "2. Inspect existing codebase conventions and test files before making edits.",
+        "3. Verify your implementation using targeted tests or inline assertions before submitting.",
+        "4. Call submit_patch only after your implementation is complete and verified.",
+        "5. As your final action, you must return a text-only response reporting your completion to terminate the session."]))
+    parts.append("## Code Intelligence Tools\nThis repository has pre-built code graph and embedding data. Use these "
+                 "tools for fast, targeted navigation:\n- `search_similar_code(query)`: Find semantically similar "
+                 "functions/classes by keyword.\n- `get_code_neighbors(node)`: Find callers, callees, and definitions "
+                 "related to a symbol.\n- `get_code_subgraph(nodes)`: Get the induced subgraph for a set of symbols.\n")
+    parts.append("## Workspace Layout\nThe repository is located at `/workspace`. Here is the directory tree (up to 3 "
+                 "levels):\n```\n" + tree + "\n```\n")
+    return "\n".join(parts)
 
 
 def unpack(snapshots, iid, dest):
@@ -189,10 +273,11 @@ def issue_identifiers(text, repo_root, files):
 
 # --------------------------------------------------------------------------- trajectory
 class Traj:
-    def __init__(self, task):
+    def __init__(self, task, tree):
+        system = SYSTEM_TEMPLATE.replace("{problem_description}", task["problem_statement"])
         self.messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": format_task(task)},
+            {"role": "system", "content": system},
+            {"role": "user", "content": format_task(task, tree, BUDGET)},
         ]
         self.n = 0
 
@@ -204,14 +289,6 @@ class Traj:
         self.messages.append({"role": "tool", "tool_call_id": cid, "name": name, "content": observation})
 
 
-def format_task(task):
-    s = f"Repository: {task['repo']}\n\n<issue>\n{task['problem_statement'].strip()}\n</issue>\n"
-    if task.get("hints_text", "").strip():
-        s += f"\n<hints>\n{task['hints_text'].strip()[:4000]}\n</hints>\n"
-    s += "\nResolve the issue by editing the source code in /workspace, then call submit_patch."
-    return s
-
-
 def build_one(task, snapshots, rng):
     files = {p: h for p, h in parse_patch(task["patch"]).items() if not is_test_path(p)}
     if not files:
@@ -219,8 +296,8 @@ def build_one(task, snapshots, rng):
     tmp = tempfile.mkdtemp(prefix="sft_")
     try:
         root = unpack(snapshots, task["instance_id"], tmp)
-        sh("git config user.email a@b.c && git config user.name sft", root)
-        t = Traj(task)
+        raw("git config user.email a@b.c && git config user.name sft", root)
+        t = Traj(task, workspace_tree(root))
 
         existing = [p for p in files if (root / p).exists()]
         idents = issue_identifiers(task["problem_statement"], root, existing)
@@ -228,29 +305,31 @@ def build_one(task, snapshots, rng):
         # 1. localise
         if idents:
             ident = idents[0]
-            cmd = f"grep -rn '{ident}' --include='*.py' . | grep -v '/tests\\?/' | head -30"
+            cmd = f'grep -rn "{ident}" --include="*.py" . | grep -v tests/ | head -30'
             t.call(f"The issue is about `{ident}`. Let me find where it is defined and used in the library code.",
                    "run_command", {"command": cmd}, sh(cmd, root))
         else:
-            top = sorted({p.split("/")[0] for p in files})
-            cmd = f"git ls-files '*.py' | grep -v '^tests/' | head -60"
-            t.call("Let me get an overview of the repository's Python source files first.",
+            cmd = "git ls-files '*.py' | grep -v tests/ | head -40"
+            t.call("Let me list the library's Python source files to find the relevant module.",
                    "run_command", {"command": cmd}, sh(cmd, root))
 
-        # 2. read every region we will touch
+        # 2. read every region we will touch, in windows of <= 80 lines
         for path, hunks in files.items():
             if not (root / path).exists():
                 continue
-            lo = max(1, min(h["old_start"] for h in hunks) - 25)
-            hi = max(h["old_start"] + len(h["old"]) for h in hunks) + 25
-            if hi - lo > 220:  # far-apart hunks: read each separately
-                for h in hunks:
-                    a, b = max(1, h["old_start"] - 20), h["old_start"] + len(h["old"]) + 20
-                    t.call(f"Reading the relevant part of `{path}`.", "read_file",
-                           {"filepath": path, "start_line": a, "end_line": b}, clip(read_slice(root, path, a, b)))
-            else:
-                t.call(f"`{path}` looks responsible. Let me read the relevant code.", "read_file",
-                       {"filepath": path, "start_line": lo, "end_line": hi}, clip(read_slice(root, path, lo, hi)))
+            windows = []
+            for h in hunks:
+                a = max(1, h["old_start"] - 15)
+                b = h["old_start"] + len(h["old"]) + 15
+                if windows and a <= windows[-1][1] + 5 and b - windows[-1][0] <= 80:
+                    windows[-1][1] = max(windows[-1][1], b)
+                else:
+                    windows.append([a, min(b, a + 79)])
+            for i, (a, b) in enumerate(windows):
+                thought = (f"`{path}` looks responsible. Let me read the relevant code." if i == 0
+                           else f"Reading the other part of `{path}` that needs to change.")
+                t.call(thought, "read_file", {"filepath": path, "start_line": a, "end_line": b},
+                       read_obs(root, path, a, b))
 
         # 3. edits
         final_texts = {}
@@ -260,8 +339,8 @@ def build_one(task, snapshots, rng):
                 content = "".join(l for h in hunks for l in h["new"])
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_text(content, encoding="utf-8")
-                t.call(f"I need a new module `{path}` for this.", "write_file",
-                       {"filepath": path, "content": content}, f"Successfully wrote {len(content)} characters to {path}")
+                t.call(f"The fix needs a new module `{path}`.", "write_file",
+                       {"filepath": path, "content": content}, ok(filepath=path, size=len(content)))
                 final_texts[path] = content
                 continue
             text = fp.read_text(encoding="utf-8")
@@ -270,40 +349,42 @@ def build_one(task, snapshots, rng):
                 return None, f"could not derive unique edits for {path}"
             edits, final = res
             for i, (old, new) in enumerate(edits):
-                thought = ("Now I'll make the fix." if i == 0 else "Applying the next part of the change.") + \
-                          f" Editing `{path}`."
+                thought = ("I understand the bug now. Making the minimal fix" if i == 0 and len(final_texts) == 0
+                           else "Applying the next part of the change") + f" in `{path}`."
                 cur = fp.read_text(encoding="utf-8")
-                fp.write_text(cur.replace(old, new, 1), encoding="utf-8")
+                after = cur.replace(old, new, 1)
+                fp.write_text(after, encoding="utf-8")
                 t.call(thought, "edit_file", {"filepath": path, "old_string": old, "new_string": new},
-                       f"Successfully edited {path} (1 replacement).")
+                       edit_obs(path, cur, after))
             final_texts[path] = final
 
-        # verify against gold
+        # verify replay == gold
         mine = {p: (root / p).read_text(encoding="utf-8") for p in final_texts}
-        sh("git stash -u -q", root)
-        gold_patch = "".join(task["patch"])
+        raw("git stash -u -q", root)
         with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as pfh:
-            pfh.write(gold_patch)
-        out = sh(f"git apply {pfh.name} 2>&1 || echo APPLY_FAILED", root)
+            pfh.write(task["patch"])
+        r = subprocess.run(["git", "apply", pfh.name], cwd=root, capture_output=True, text=True)
         os.unlink(pfh.name)
-        if "APPLY_FAILED" in out:
+        if r.returncode != 0:
             return None, "gold patch does not apply"
         for p, txt in mine.items():
             if (root / p).read_text(encoding="utf-8") != txt:
                 return None, f"replayed edits differ from gold for {p}"
-        # restore the agent's state: keep gold source changes, drop test changes
-        for p in list(parse_patch(task["patch"])):
+        for p in list(parse_patch(task["patch"])):  # agent state = gold source changes only
             if is_test_path(p):
-                sh(f"git checkout -q -- '{p}' 2>/dev/null || rm -f '{p}'", root)
+                raw(f"git checkout -q -- '{p}' 2>/dev/null || rm -f '{p}'", root)
 
-        # 4. compile check + diff, 5. submit
+        # 4. submit early (free), then verify, then finish with text
+        diff = raw("git add -N . && git diff HEAD", root)
+        t.call("The fix is in place. Submitting now so the work is safe, then I will verify it.", "submit_patch", {},
+               ok(patch_size=len(diff), files_changed=diff.count("diff --git")))
         changed = " ".join(f"'{p}'" for p in files)
-        cmd = f"PYTHONDONTWRITEBYTECODE=1 python -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' {changed} && git diff --stat"
-        t.call("The change is in place. Let me check it compiles and review the diff.", "run_command",
+        cmd = (f"python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]; print(\"syntax ok\")' "
+               f"{changed} && git status --short")
+        t.call("Checking that the changed files parse and that only intended files are modified.", "run_command",
                {"command": cmd}, sh(cmd, root))
-        diff = sh("git add -N . && git diff HEAD", root)
-        t.call("The diff contains only the intended source change. Submitting the patch.", "submit_patch", {}, diff)
-        t.messages.append({"role": "assistant", "content": "I have submitted the patch that resolves the issue."})
+        summary = ", ".join(f"`{p}`" for p in files)
+        t.messages.append({"role": "assistant", "content": f"Fixed the issue by updating {summary}; the patch is submitted."})
         return {"instance_id": task["instance_id"], "messages": t.messages, "tools": TOOLS}, None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

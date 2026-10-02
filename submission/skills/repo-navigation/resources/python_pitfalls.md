@@ -13,5 +13,5 @@
 - Pydantic v1 vs v2 code paths in FastAPI (`PYDANTIC_V2` branches): update both.
 - Rich renderables: width/measurement must stay consistent with `__rich_console__`
   output; check `Segment` styles and `no_wrap`/`overflow` handling.
-- Leaving debug prints, repro scripts or new untracked files in the workspace
+- Leaving debug prints, repro scripts or new untracked files in /workspace (write scratch to /tmp)
   (`submit_patch` stages untracked files too).

@@ -17,13 +17,13 @@ def is_test(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
-    ap.add_argument("--root", default=".")
+    ap.add_argument("--root", default="/workspace" if os.path.isdir("/workspace") else ".")
     ap.add_argument("--include-tests", action="store_true")
-    ap.add_argument("--max-usages", type=int, default=40)
+    ap.add_argument("--max-usages", type=int, default=20)
     a = ap.parse_args()
     root = a.root
-    if not os.path.isdir(root) and os.path.isdir("/workspace"):
-        root = "/workspace"
+    if not os.path.isabs(root) and os.path.isdir("/workspace"):
+        root = os.path.join("/workspace", root)
     leaf = a.name.split(".")[-1]
     owner = a.name.split(".")[-2] if "." in a.name else None
     w = re.escape(leaf)
@@ -52,11 +52,11 @@ def main():
                 if def_re.search(line) and not test:
                     ctx = f" (in class {current_class})" if current_class and line.startswith((" ", "\t")) else ""
                     if owner is None or owner == current_class or not ctx:
-                        defs.append(f"{rel}:{i}: {line.strip()[:160]}{ctx}")
+                        defs.append(f"{rel}:{i}: {line.strip()[:120]}{ctx}")
                         continue
                 if test and not a.include_tests:
                     continue
-                uses.append(f"{rel}:{i}: {line.strip()[:160]}")
+                uses.append(f"{rel}:{i}: {line.strip()[:120]}")
     print(f"DEFINITIONS of {a.name} ({len(defs)}):")
     for d in defs[:20]:
         print("  " + d)

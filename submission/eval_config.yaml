@@ -1,0 +1,11 @@
+# Per-task budgets. The scorer reads only these four fields and runs ~120 tasks
+# SEQUENTIALLY under a hard 12 h cap; exceeding it fails the whole submission.
+#   120 tasks x (4.5 min agent + ~0.5-1 min setup/verify) ~= 11 h worst case.
+# timeout_seconds is the per-command timeout AND the hidden-test pytest timeout
+# during verification, so keep it >= 180 or correct patches can time out.
+# The sample_submission ships 1 min / 10 calls, which scores ~0: don't reuse it.
+evaluation:
+  timeout_seconds: 180
+  max_tool_calls: 40
+  max_time_minutes: 4.5
+  max_turns: 80

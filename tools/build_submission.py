@@ -3,8 +3,14 @@
 
 Checks performed:
   * agent.yaml exists at the root and parses (with `!include` resolved).
-  * every `!include` / `config_path` resolves to a file inside the submission
-    root (no `..` escapes, no symlinks).
+  * every `!include` resolves inside the submission root (relative to the
+    including file; `..` is fine if it stays inside), and every `config_path` /
+    skill path is relative with no `..` component at all (adk_submission rule).
+  * `tools` entries are plain tool names or `agent_tool: {config_path: ...}`.
+  * prompts contain no `{placeholder}` other than the session-state keys the
+    harness provides (problem_description, hints).
+  * generation params are within the scorer's bounds; eval_config.yaml has only
+    the four fields the scorer reads.
   * every LlmAgent uses the only allowed model.
   * every `adapter:` reference has adapters/<name>/adapter_config.json and
     adapter_model.safetensors.
@@ -60,6 +66,51 @@ def load_yaml(root: pathlib.Path, path: pathlib.Path):
         return yaml.load(fh, Loader=make_loader(root, path.parent))  # noqa: S506 (custom SafeLoader)
 
 
+HARNESS_TOOLS = {"run_command", "read_file", "edit_file", "write_file", "search_similar_code",
+                 "get_code_neighbors", "get_code_subgraph", "get_status", "submit_patch"}
+STATE_KEYS = {"problem_description", "hints"}
+LLM_FIELDS = {"name", "description", "agent_class", "model", "adapter", "instruction", "output_key",
+              "include_contents", "disallow_transfer_to_parent", "disallow_transfer_to_peers", "tools",
+              "skills", "sub_agents", "generate_content_config", "before_agent_callbacks",
+              "after_agent_callbacks", "before_model_callbacks", "after_model_callbacks",
+              "before_tool_callbacks", "after_tool_callbacks"}
+GEN_FIELDS = {"temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences", "presence_penalty",
+              "frequency_penalty", "response_mime_type", "seed", "thinking_config"}
+
+
+def lexical_ok(rel: str, what: str, src) -> bool:
+    if rel.startswith(("/", "\\")) or ".." in pathlib.PurePosixPath(rel).parts:
+        errors.append(f"{src}: {what} must be relative without '..': {rel}")
+        return False
+    return True
+
+
+def check_instruction(text: str, src):
+    # ADK substitutes {identifier} / {identifier?} from session state; unknown keys raise.
+    for m in re.finditer(r"{+([^{}]*)}+", text):
+        key = m.group(1).strip().rstrip("?")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in STATE_KEYS and not m.group(1).strip().endswith("?"):
+            errors.append(f"{src}: instruction contains {{{key}}}, which is not a session-state key "
+                          f"({', '.join(sorted(STATE_KEYS))}); ADK will fail at runtime")
+
+
+def check_gen(cfg, src):
+    if not cfg:
+        return
+    if not isinstance(cfg, dict):
+        errors.append(f"{src}: generate_content_config must be a mapping")
+        return
+    for k in cfg:
+        if k not in GEN_FIELDS:
+            errors.append(f"{src}: generate_content_config.{k} is not allowed")
+    mot = cfg.get("max_output_tokens")
+    if mot is not None and not (1 <= mot <= 32768):
+        errors.append(f"{src}: max_output_tokens must be 1..32768")
+    tc = cfg.get("thinking_config") or {}
+    if tc.get("thinking_budget") is not None and not (1 <= tc["thinking_budget"] <= 32768):
+        errors.append(f"{src}: thinking_budget must be 1..32768")
+
+
 def check_agent(root: pathlib.Path, path: pathlib.Path, cfg: dict, seen: set):
     rel = path.relative_to(root)
     if path in seen:
@@ -68,34 +119,68 @@ def check_agent(root: pathlib.Path, path: pathlib.Path, cfg: dict, seen: set):
     if not isinstance(cfg, dict):
         errors.append(f"{rel}: not a mapping")
         return
-    for key in ("name", "instruction"):
-        if not cfg.get(key):
-            errors.append(f"{rel}: missing `{key}`")
-    if cfg.get("agent_class", "LlmAgent") == "LlmAgent" and cfg.get("model") != MODEL:
-        errors.append(f"{rel}: model must be {MODEL!r}, got {cfg.get('model')!r}")
-    adapter = cfg.get("adapter")
-    if adapter:
-        d = root / "adapters" / adapter
-        for f in ("adapter_config.json", "adapter_model.safetensors"):
-            if not (d / f).is_file():
-                errors.append(f"{rel}: adapter {adapter!r} missing {d.relative_to(root)}/{f}")
-    refs = []
-    for sub in cfg.get("sub_agents") or []:
-        if isinstance(sub, dict) and sub.get("config_path"):
-            refs.append(sub["config_path"])
-    for tool in cfg.get("tools") or []:
-        if isinstance(tool, dict) and tool.get("name") == "AgentTool":
-            agent = ((tool.get("args") or {}).get("agent") or {})
-            if agent.get("config_path"):
-                refs.append(agent["config_path"])
+    cls = cfg.get("agent_class") or "LlmAgent"
+    refs = [s["config_path"] for s in cfg.get("sub_agents") or [] if isinstance(s, dict) and "config_path" in s]
+    if cls == "LlmAgent":
+        for k in cfg:
+            if k not in LLM_FIELDS:
+                errors.append(f"{rel}: unknown LlmAgent field `{k}`")
+        if not cfg.get("name") or not cfg.get("instruction"):
+            errors.append(f"{rel}: `name` and `instruction` are required")
+        if cfg.get("model") != MODEL:
+            errors.append(f"{rel}: model must be {MODEL!r}, got {cfg.get('model')!r}")
+        check_instruction(cfg.get("instruction") or "", rel)
+        check_gen(cfg.get("generate_content_config"), rel)
+        adapter = cfg.get("adapter")
+        if adapter:
+            d = root / "adapters" / adapter
+            for f in ("adapter_config.json", "adapter_model.safetensors"):
+                if not (d / f).is_file():
+                    errors.append(f"{rel}: adapter {adapter!r} missing {d.relative_to(root)}/{f}")
+        for tool in cfg.get("tools") or []:
+            if isinstance(tool, str):
+                if tool not in HARNESS_TOOLS:
+                    errors.append(f"{rel}: unknown tool {tool!r} (harness tools: {sorted(HARNESS_TOOLS)})")
+            elif isinstance(tool, dict) and set(tool) == {"agent_tool"} and isinstance(tool["agent_tool"], dict):
+                at = tool["agent_tool"]
+                extra = set(at) - {"config_path", "skip_summarization"}
+                if extra or "config_path" not in at:
+                    errors.append(f"{rel}: agent_tool takes config_path (+ skip_summarization), got {sorted(at)}")
+                else:
+                    refs.append(at["config_path"])
+            else:
+                errors.append(f"{rel}: tools entries must be a tool name or `agent_tool: {{config_path: ...}}`, got {tool!r}")
+        for sk in cfg.get("skills") or []:
+            if lexical_ok(sk, "skill path", rel) and not (root / sk / "SKILL.md").is_file():
+                errors.append(f"{rel}: skill {sk!r} has no SKILL.md")
     for ref in refs:
-        # ADK resolves config_path relative to the referencing file; also accept root-relative.
-        cands = [path.parent / ref, root / ref]
-        target = next((c for c in cands if c.is_file() and inside(root, c)), None)
+        if not lexical_ok(ref, "config_path", rel):
+            continue
+        # adk_submission tries the referencing file's directory first, then the root.
+        target = next((c for c in (path.parent / ref, root / ref) if c.is_file() and inside(root, c)), None)
         if target is None:
-            errors.append(f"{rel}: sub-agent config not found inside root: {ref}")
+            errors.append(f"{rel}: sub-agent config not found: {ref}")
             continue
         check_agent(root, target, load_yaml(root, target), seen)
+
+
+def check_eval_config(root: pathlib.Path):
+    p = root / "eval_config.yaml"
+    if not p.is_file():
+        print("WARNING: no eval_config.yaml -> scorer uses no per-task limit; risk of the 12 h cap")
+        return
+    ev = (yaml.safe_load(p.read_text()) or {}).get("evaluation") or {}
+    allowed = {"timeout_seconds", "max_tool_calls", "max_time_minutes", "max_turns"}
+    for k in ev:
+        if k not in allowed:
+            errors.append(f"eval_config.yaml: evaluation.{k} is ignored by the scorer")
+    mins = ev.get("max_time_minutes")
+    if mins is None:
+        print("WARNING: eval_config.yaml has no max_time_minutes; 120 sequential tasks may exceed 12 h")
+    elif mins * 120 / 60 + 120 * 0.75 / 60 > 12:
+        errors.append(f"eval_config.yaml: max_time_minutes={mins} x 120 tasks + overhead exceeds the 12 h cap")
+    if (ev.get("timeout_seconds") or 180) < 180:
+        print("WARNING: timeout_seconds < 180 also limits hidden-test verification")
 
 
 def check_skills(root: pathlib.Path):
@@ -134,6 +219,14 @@ def main():
             errors.append(f"symlink not allowed: {p.relative_to(root)}")
     check_agent(root, agent, load_yaml(root, agent), set())
     check_skills(root)
+    check_eval_config(root)
+    allowed_ext = {".yaml", ".yml", ".md", ".txt", ".py", ".json", ".safetensors"}  # swegemma ALLOWED_SUBMISSION_EXTENSIONS
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix not in allowed_ext and "__pycache__" not in p.parts and p.name != ".gitkeep":
+            errors.append(f"file type not allowed in submission: {p.relative_to(root)}")
+    size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+    if size >= 3 * 1024 ** 3:
+        errors.append(f"submission is {size / 1024 ** 3:.2f} GiB; limit is 3 GiB")
     if errors:
         for e in errors:
             print("ERROR:", e)

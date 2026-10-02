@@ -1,13 +1,13 @@
 ---
 name: verify-fix
-description: Verify a fix before submitting. Runs the relevant pytest targets with a timeout and compact output, and sanity-checks the pending git diff (syntax errors, leftover scratch files, edited tests, debug prints). Use after editing and right before submit_patch.
+description: Check a fix before finishing. check_patch.py inspects the pending git diff (syntax errors, scratch or __pycache__ files, edited tests, empty patch); run_tests.py runs targeted pytest with a timeout and a short summary.
 ---
 
 # verify-fix
 
-| Script | Purpose | Example args |
-|---|---|---|
-| `scripts/run_tests.py` | Run pytest on given targets with a timeout; prints a short summary and the first failure. | `--targets tests/test_utils.py` `--keyword merge` `--timeout 300` |
-| `scripts/check_patch.py` | Lint the pending `git diff HEAD`: changed files compile, no scratch/debug files, warns if only tests changed or no source changed. | (no args) |
+Pass `args` as a list of strings. Both scripts operate on `/workspace`.
 
-Call `check_patch.py` immediately before `submit_patch`. Fix every ERROR it reports.
+| Script | Purpose | args example |
+|---|---|---|
+| `scripts/check_patch.py` | Lint the pending `git diff HEAD`. Fix every ERROR before finishing. | `[]` |
+| `scripts/run_tests.py` | `pytest -x -q` on given targets with a timeout; prints summary + first failure. | `["--targets", "tests/test_utils.py", "--keyword", "merge"]` |

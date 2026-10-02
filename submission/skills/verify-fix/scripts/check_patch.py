@@ -23,8 +23,10 @@ def main():
     for f in files:
         path = os.path.join(cwd, f)
         is_test = bool(re.search(r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|conftest\.py$", f))
+        if re.search(r"(^|/)(pytest\.ini|conftest\.py)$", f) and "/" not in f:
+            errors.append(f"harness file modified: {f} (git checkout -- {f})")
         if SCRATCH.search(f):
-            errors.append(f"scratch file will be submitted: {f} (rm it)")
+            errors.append(f"scratch file will be submitted: {f} (rm it; scratch belongs in /tmp)")
         if f.endswith(".py") and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:

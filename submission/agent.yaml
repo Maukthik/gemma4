@@ -1,24 +1,27 @@
-# Root coding agent. ADK Agent Config (LlmAgent) + competition extensions.
-# NOTE: verify field names against sample_submission/agent.yaml from the
-# competition dataset (especially `adapter` and how harness tools are listed).
+# Root coding agent. Schema: adk_submission SandboxedLlmAgentConfig.
+#  - tools: plain registry names (strings) or `agent_tool: {config_path: ...}` entries
+#  - skills: paths to skill directories inside the submission
+#  - instruction is ADK-templated: {problem_description} is filled from session state.
+#    Never put any other {word} in prompts/*.md (an unknown key raises at runtime).
 name: swe_coder
-agent_class: LlmAgent
 model: gemma-4-31b-it-qat-w4a16-ct
-# adapter: main_lora          # enable once adapters/main_lora/ is trained
-description: Autonomous software engineer that fixes Python repository issues and submits a patch.
+# adapter: main_lora          # enable once adapters/main_lora/ is trained and validated
+description: Autonomous software engineer that fixes Python repository issues with minimal, verified patches.
 instruction: !include prompts/system.md
 generate_content_config: !include configs/sampling.yaml
 tools:
-  - name: run_command
-  - name: read_file
-  - name: edit_file
-  - name: write_file
-  - name: search_similar_code
-  - name: get_code_neighbors
-  - name: get_code_subgraph
-  - name: get_status
-  - name: submit_patch
-  - name: AgentTool
-    args:
-      agent:
-        config_path: sub_agents/code_analyzer.yaml
+  - run_command
+  - read_file
+  - edit_file
+  - write_file
+  - search_similar_code
+  - get_code_neighbors
+  - get_status
+  - submit_patch
+  # Optional read-only localisation helper (costs time; A/B before enabling):
+  # - agent_tool:
+  #     config_path: sub_agents/code_analyzer.yaml
+  #     skip_summarization: false
+skills:
+  - skills/repo-navigation
+  - skills/verify-fix

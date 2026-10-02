@@ -10,12 +10,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", help="source file, e.g. requests/sessions.py")
     ap.add_argument("--name", help="symbol, e.g. Session.request")
-    ap.add_argument("--root", default=".")
+    ap.add_argument("--root", default="/workspace" if os.path.isdir("/workspace") else ".")
     a = ap.parse_args()
     if not a.path and not a.name:
         print("give --path and/or --name")
         return 2
-    root = a.root if os.path.isdir(a.root) else "/workspace"
+    root = a.root
+    if not os.path.isabs(root) and os.path.isdir("/workspace"):
+        root = os.path.join("/workspace", root)
     needles = []
     if a.path:
         mod = os.path.splitext(a.path.replace("\\", "/"))[0]
@@ -63,7 +65,7 @@ def main():
         extra = f"  tests mentioning name: {', '.join(tests[:8])}" if tests else ""
         print(f"{rel} (score {score}){extra}")
     if results:
-        print(f"\nrun: timeout 300 python -m pytest -x -q {results[0][1]} 2>&1 | tail -30")
+        print(f"\nrun: timeout 150 python3 -m pytest -x -q {results[0][1]} 2>&1 | tail -15")
 
 
 if __name__ == "__main__":

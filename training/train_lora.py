@@ -21,6 +21,13 @@ Notes:
     accepts the target modules you pick (HARNESS_README.md).
   * Keep the dataset small and on-policy-like; with ~100 tasks, 2-3 epochs at
     a low LR is plenty. Watch for regressions on the holdout split.
+  * Defaults are rank 8 on attention projections only: rank-32 all-layer
+    LoRA on the compressed-tensors W4A16 model was reported unstable in vLLM
+    (issue #50059), while small partial adapters load fine. The scorer serves
+    with max_lora_rank=128, max_loras=8. Load-test the adapter in vLLM with the
+    QAT checkpoint before submitting.
+  * Mix data with repeated --data: scripted trajectories (build_sft_data.py)
+    and real successful runs (traces_to_sft.py).
 """
 import argparse
 import json
@@ -34,21 +41,23 @@ from torch.utils.data import Dataset
 def parse():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--data", action="append", required=True, help="JSONL file; repeat to mix")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-len", type=int, default=16384)
     ap.add_argument("--epochs", type=float, default=2)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--alpha", type=int, default=32)
+    ap.add_argument("--rank", type=int, default=8)
+    ap.add_argument("--alpha", type=int, default=16)
     ap.add_argument("--grad-accum", type=int, default=8)
-    ap.add_argument("--targets", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+    ap.add_argument("--targets", default="q_proj,k_proj,v_proj,o_proj")
     ap.add_argument("--no-4bit", action="store_true", help="load bf16 (needs much more memory)")
     return ap.parse_args()
 
 
 def render(tok, messages, tools, gen_prompt=False):
-    return tok.apply_chat_template(messages, tools=tools, tokenize=False, add_generation_prompt=gen_prompt)
+    # enable_thinking=False matches serving (sampling.yaml include_thoughts: false).
+    return tok.apply_chat_template(messages, tools=tools, tokenize=False, add_generation_prompt=gen_prompt,
+                                   enable_thinking=False)
 
 
 def encode(tok, ex, max_len):
@@ -70,16 +79,17 @@ def encode(tok, ex, max_len):
 
 
 class Traj(Dataset):
-    def __init__(self, tok, path, max_len):
+    def __init__(self, tok, paths, max_len):
         self.items, dropped = [], 0
-        for line in open(path, encoding="utf-8"):
-            if not line.strip():
-                continue
-            enc = encode(tok, json.loads(line), max_len)
-            if enc is None:
-                dropped += 1
-            else:
-                self.items.append(enc)
+        for path in paths:
+            for line in open(path, encoding="utf-8"):
+                if not line.strip():
+                    continue
+                enc = encode(tok, json.loads(line), max_len)
+                if enc is None:
+                    dropped += 1
+                else:
+                    self.items.append(enc)
         n_sup = sum(sum(l != -100 for l in it["labels"]) for it in self.items)
         print(f"loaded {len(self.items)} examples ({dropped} dropped > max_len); {n_sup} supervised tokens")
 
@@ -117,9 +127,12 @@ def main():
     quant = None if a.no_4bit else BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16)
-    model = AutoModelForCausalLM.from_pretrained(
-        a.model, quantization_config=quant, torch_dtype=torch.bfloat16, device_map="auto",
-        attn_implementation="sdpa")
+    load = dict(quantization_config=quant, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="sdpa")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(a.model, **load)
+    except (ValueError, KeyError):  # multimodal Gemma 4 checkpoints register under image-text-to-text
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(a.model, **load)
     model.config.use_cache = False
     if quant is not None:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
