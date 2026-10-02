@@ -1,0 +1,7 @@
+# Generation parameters (google.genai GenerateContentConfig fields).
+# Low temperature: tool calls need exact strings (edit_file old_string), so
+# we want near-greedy decoding. A little temperature avoids repetition loops.
+temperature: 0.2
+top_p: 0.95
+top_k: 40
+max_output_tokens: 4096

@@ -1,0 +1,24 @@
+# Root coding agent. ADK Agent Config (LlmAgent) + competition extensions.
+# NOTE: verify field names against sample_submission/agent.yaml from the
+# competition dataset (especially `adapter` and how harness tools are listed).
+name: swe_coder
+agent_class: LlmAgent
+model: gemma-4-31b-it-qat-w4a16-ct
+# adapter: main_lora          # enable once adapters/main_lora/ is trained
+description: Autonomous software engineer that fixes Python repository issues and submits a patch.
+instruction: !include prompts/system.md
+generate_content_config: !include configs/sampling.yaml
+tools:
+  - name: run_command
+  - name: read_file
+  - name: edit_file
+  - name: write_file
+  - name: search_similar_code
+  - name: get_code_neighbors
+  - name: get_code_subgraph
+  - name: get_status
+  - name: submit_patch
+  - name: AgentTool
+    args:
+      agent:
+        config_path: sub_agents/code_analyzer.yaml

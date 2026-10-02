@@ -1,0 +1,9 @@
+# Pre-installed on Kaggle GPU images; attach as an offline dataset if a version is missing.
+torch
+transformers>=4.57
+peft>=0.17
+accelerate
+bitsandbytes
+pyyaml
+pandas
+pyarrow

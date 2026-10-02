@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+submission.zip
+training/data/
+eval_results.jsonl
+submission/adapters/*/
+!submission/adapters/.gitkeep
