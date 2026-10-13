@@ -40,6 +40,7 @@ training/build_sft_data.py      scripted expert trajectories replayed on real sn
 training/traces_to_sft.py       official ATIF traces of *resolved* runs -> SFT data (rejection sampling)
 training/train_lora.py          QLoRA SFT, assistant-only loss, multiple --data files
 kaggle/run_agent_eval.py        official harness on Kaggle L4x4: evaluate, or sample rollouts for training
+docs/LEARNING_GUIDE.md          beginner's guide to this repo, with hands-on exercises
 ```
 
 Verified here: the submission compiles with the real `adk_submission.compile_submission`
